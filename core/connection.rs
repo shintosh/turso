@@ -2237,6 +2237,41 @@ impl Connection {
         })
     }
 
+    /// Read a database page by 1-based page number, consulting WAL first, then main.db.
+    /// Returns the raw page bytes. This is the same read path used by normal SQL queries.
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn read_page_raw(&self, page_no: u32, buf: &mut [u8]) -> Result<()> {
+        let pager = self.pager.load();
+        // page_idx is 0-based internally in the pager
+        let page_idx = (page_no - 1) as i64;
+        let (page_ref, completion) = pager.read_page_no_cache(page_idx, None, false)?;
+        self.db.io.wait_for_completion(completion)?;
+        let inner = page_ref.get();
+        let src = inner.as_ptr();
+        let len = buf.len().min(src.len());
+        buf[..len].copy_from_slice(&src[..len]);
+        Ok(())
+    }
+
+    /// Returns the total number of pages in the database by reading the database header
+    /// from page 1 (which itself consults WAL then main.db).
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn db_page_count(&self) -> Result<u32> {
+        let page_size = self.get_page_size().get() as usize;
+        let mut page1 = vec![0u8; page_size];
+        self.read_page_raw(1, &mut page1)?;
+        // database_size is at offset 28 in the SQLite header (4 bytes, big-endian)
+        let db_size = u32::from_be_bytes([page1[28], page1[29], page1[30], page1[31]]);
+        if db_size == 0 {
+            // Per SQLite docs, database_size=0 in the header means "compute from file size"
+            let pager = self.pager.load();
+            let file_size = pager.db_file.size()?;
+            Ok((file_size / page_size as u64) as u32)
+        } else {
+            Ok(db_size)
+        }
+    }
+
     /// Insert `frame` (header included) at the position `frame_no` in the WAL
     /// If WAL already has frame at that position - turso-db will compare content of the page and either report conflict or return OK
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error

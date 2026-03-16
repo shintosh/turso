@@ -598,6 +598,43 @@ impl TursoSyncServer {
 
         let db_size = current_db_size_pages(&conn, wal_state.max_frame)?;
 
+        // For full bootstrap (client starts from 0), read pages not present in
+        // WAL via the Connection's read_page_raw which consults WAL first, then
+        // falls back to main.db. This fixes bootstrap after WAL checkpoint or
+        // tursodb restart, where checkpointed pages exist only in main.db.
+        if client_revision == 0 {
+            let total_pages = db_size as u32;
+
+            if total_pages > 0 {
+                let missing: Vec<u32> = (1..=total_pages)
+                    .filter(|pg| !seen_pages.contains(pg))
+                    .filter(|pg| {
+                        if let Some(ref selector) = pages_selector {
+                            selector.contains(pg - 1)
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+
+                if !missing.is_empty() {
+                    debug!(
+                        "Bootstrap: serving {} pages from database ({} from WAL, {} total)",
+                        missing.len(),
+                        seen_pages.len(),
+                        total_pages
+                    );
+                    for page_no in missing {
+                        let mut page_data = vec![0u8; PAGE_SIZE];
+                        if conn.read_page_raw(page_no, &mut page_data).is_ok() {
+                            let page_id = page_no - 1;
+                            pages_to_send.push((page_id, page_data));
+                        }
+                    }
+                }
+            }
+        }
+
         let header = PullUpdatesRespProtoBody {
             server_revision: server_revision.to_string(),
             db_size,
