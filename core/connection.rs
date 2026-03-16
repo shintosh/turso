@@ -2242,8 +2242,8 @@ impl Connection {
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn read_page_raw(&self, page_no: u32, buf: &mut [u8]) -> Result<()> {
         let pager = self.pager.load();
-        // page_idx is 0-based internally in the pager
-        let page_idx = (page_no - 1) as i64;
+        // pager uses 1-based page indexing (page 1 = SQLite header page)
+        let page_idx = page_no as i64;
         let (page_ref, completion) = pager.read_page_no_cache(page_idx, None, false)?;
         self.db.io.wait_for_completion(completion)?;
         let inner = page_ref.get();
