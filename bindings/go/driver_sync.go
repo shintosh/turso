@@ -407,7 +407,11 @@ func (d *TursoSyncDb) driveOpUntilDone(ctx context.Context, op TursoSyncOperatio
 }
 
 // processOneIo handles at most one IO item (used as extra IO iteration inside SQL driver).
+// Must hold d.mu to avoid racing with Connect/Pull/Push which also access d.db.
 func (d *TursoSyncDb) processOneIo() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	item, err := turso_sync_database_io_take_item(d.db)
 	if err != nil {
 		return err
