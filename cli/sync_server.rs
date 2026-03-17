@@ -2,15 +2,16 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use prost::Message;
 use roaring::RoaringBitmap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
@@ -38,12 +39,20 @@ const MVCC_TX_EXT_HEADER_SIZE: usize = 40;
 const MVCC_TX_TRAILER_SIZE: usize = 8;
 const MVCC_TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
+const HEALTH_LOG_INTERVAL_SECS: u64 = 30;
+const SLOW_REQUEST_THRESHOLD_MS: u128 = 1000;
+const SLOW_LOCK_THRESHOLD_MS: u128 = 50;
 
 pub struct TursoSyncServer {
     address: String,
     db_path: String,
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
+    active_connections: Arc<AtomicUsize>,
+    total_requests: Arc<AtomicU64>,
+    total_pull_updates: Arc<AtomicU64>,
+    total_pipelines: Arc<AtomicU64>,
+    total_bootstraps: Arc<AtomicU64>,
 }
 
 impl TursoSyncServer {
@@ -60,26 +69,89 @@ impl TursoSyncServer {
             db_path,
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            total_requests: Arc::new(AtomicU64::new(0)),
+            total_pull_updates: Arc::new(AtomicU64::new(0)),
+            total_pipelines: Arc::new(AtomicU64::new(0)),
+            total_bootstraps: Arc::new(AtomicU64::new(0)),
         })
     }
 
     pub fn run(&self) -> Result<()> {
-        info!("Starting TursoSyncServer on {}", self.address);
+        info!(
+            address = %self.address,
+            "Starting TursoSyncServer"
+        );
 
         let listener = TcpListener::bind(&self.address)?;
         listener.set_nonblocking(true)?;
 
         let interrupt_count = self.interrupt_count.clone();
-        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_flag_clone = shutdown_flag.clone();
 
         let monitor_handle = thread::spawn(move || loop {
             if interrupt_count.load(Ordering::SeqCst) > 0 {
-                debug!("Interrupt detected, signaling shutdown");
+                info!("Interrupt detected, signaling shutdown");
                 shutdown_flag_clone.store(true, Ordering::SeqCst);
                 break;
             }
             thread::sleep(std::time::Duration::from_millis(100));
+        });
+
+        // Periodic WAL health logging thread
+        let health_conn = self.conn.clone();
+        let health_shutdown = shutdown_flag.clone();
+        let health_active = self.active_connections.clone();
+        let health_requests = self.total_requests.clone();
+        let health_pulls = self.total_pull_updates.clone();
+        let health_pipelines = self.total_pipelines.clone();
+        let health_bootstraps = self.total_bootstraps.clone();
+        let health_handle = thread::spawn(move || loop {
+            if health_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_secs(HEALTH_LOG_INTERVAL_SECS));
+            if health_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let active = health_active.load(Ordering::Relaxed);
+            let reqs = health_requests.load(Ordering::Relaxed);
+            let pulls = health_pulls.load(Ordering::Relaxed);
+            let pipes = health_pipelines.load(Ordering::Relaxed);
+            let boots = health_bootstraps.load(Ordering::Relaxed);
+
+            let lock_start = Instant::now();
+            let conn = health_conn.lock().unwrap();
+            let lock_ms = lock_start.elapsed().as_millis();
+
+            match conn.wal_state() {
+                Ok(wal_state) => {
+                    let page_count = conn.db_page_count().unwrap_or(0);
+                    info!(
+                        wal_max_frame = wal_state.max_frame,
+                        db_pages = page_count,
+                        db_size_kb = (page_count as u64 * PAGE_SIZE as u64) / 1024,
+                        active_connections = active,
+                        total_requests = reqs,
+                        total_pull_updates = pulls,
+                        total_pipelines = pipes,
+                        total_bootstraps = boots,
+                        lock_wait_ms = lock_ms as u64,
+                        "health: WAL status"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        active_connections = active,
+                        lock_wait_ms = lock_ms as u64,
+                        "health: failed to read WAL state"
+                    );
+                }
+            }
+            drop(conn);
         });
 
         loop {
@@ -90,9 +162,39 @@ impl TursoSyncServer {
 
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    info!("Accepted connection from {}", addr);
-                    if let Err(e) = self.handle_connection(stream) {
-                        error!("Error handling connection: {}", e);
+                    let active = self.active_connections.fetch_add(1, Ordering::SeqCst) + 1;
+                    let req_id = self.total_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    info!(
+                        peer = %addr,
+                        active_connections = active,
+                        req_id = req_id,
+                        "accepted connection"
+                    );
+                    let conn_start = Instant::now();
+                    if let Err(e) = self.handle_connection(stream, req_id) {
+                        error!(
+                            req_id = req_id,
+                            elapsed_ms = conn_start.elapsed().as_millis() as u64,
+                            error = %e,
+                            "connection error"
+                        );
+                    }
+                    let remaining = self.active_connections.fetch_sub(1, Ordering::SeqCst) - 1;
+                    let elapsed = conn_start.elapsed();
+                    if elapsed.as_millis() > SLOW_REQUEST_THRESHOLD_MS {
+                        warn!(
+                            req_id = req_id,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            active_connections = remaining,
+                            "slow request completed"
+                        );
+                    } else {
+                        debug!(
+                            req_id = req_id,
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            active_connections = remaining,
+                            "connection completed"
+                        );
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -100,20 +202,22 @@ impl TursoSyncServer {
                     continue;
                 }
                 Err(e) => {
-                    error!("Error accepting connection: {}", e);
+                    error!(error = %e, "accept error");
                 }
             }
         }
 
         let _ = monitor_handle.join();
+        let _ = health_handle.join();
         info!("TursoSyncServer stopped");
         Ok(())
     }
 
-    fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+    fn handle_connection(&self, mut stream: TcpStream, req_id: u64) -> Result<()> {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
 
+        let read_start = Instant::now();
         let mut buffer = [0u8; 8192];
         let mut request_data = Vec::new();
 
@@ -148,10 +252,19 @@ impl TursoSyncServer {
             }
             break;
         }
+        let read_elapsed = read_start.elapsed();
 
         let (method, path, body) = parse_http_request(&request_data)?;
-        info!("Request: {} {}", method, path);
+        info!(
+            req_id = req_id,
+            method = %method,
+            path = %path,
+            body_bytes = body.len(),
+            read_ms = read_elapsed.as_millis() as u64,
+            "request"
+        );
 
+        let handler_start = Instant::now();
         let response = match (method.as_str(), path.as_str()) {
             ("OPTIONS", _) => Ok(HttpResponse {
                 status: 204,
@@ -159,15 +272,20 @@ impl TursoSyncServer {
                 body: Vec::new(),
             }),
             ("POST", "/v2/pipeline") => {
-                debug!("Handling /v2/pipeline request");
-                self.handle_pipeline(&body)
+                self.total_pipelines.fetch_add(1, Ordering::Relaxed);
+                self.handle_pipeline(&body, req_id)
             }
             ("POST", "/pull-updates") => {
-                debug!("Handling /pull-updates request");
-                self.handle_pull_updates(&body)
+                self.total_pull_updates.fetch_add(1, Ordering::Relaxed);
+                self.handle_pull_updates(&body, req_id)
             }
             _ => {
-                info!("Unknown endpoint: {} {}", method, path);
+                warn!(
+                    req_id = req_id,
+                    method = %method,
+                    path = %path,
+                    "unknown endpoint"
+                );
                 Ok(HttpResponse {
                     status: 404,
                     content_type: "text/plain".to_string(),
@@ -175,11 +293,17 @@ impl TursoSyncServer {
                 })
             }
         };
+        let handler_elapsed = handler_start.elapsed();
 
         let http_response = match response {
             Ok(resp) => resp,
             Err(e) => {
-                error!("Request error: {}", e);
+                error!(
+                    req_id = req_id,
+                    handler_ms = handler_elapsed.as_millis() as u64,
+                    error = %e,
+                    "request handler error"
+                );
                 HttpResponse {
                     status: 500,
                     content_type: "text/plain".to_string(),
@@ -188,21 +312,43 @@ impl TursoSyncServer {
             }
         };
 
+        let write_start = Instant::now();
         let response_bytes = format_http_response(&http_response);
         stream.write_all(&response_bytes)?;
         stream.flush()?;
+        let write_elapsed = write_start.elapsed();
+
+        debug!(
+            req_id = req_id,
+            status = http_response.status,
+            response_bytes = response_bytes.len(),
+            handler_ms = handler_elapsed.as_millis() as u64,
+            write_ms = write_elapsed.as_millis() as u64,
+            "response sent"
+        );
 
         Ok(())
     }
 
-    fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {
+    fn handle_pipeline(&self, body: &[u8], req_id: u64) -> Result<HttpResponse> {
         let req: PipelineReqBody = serde_json::from_slice(body)
             .map_err(|e| anyhow!("Failed to parse pipeline request: {}", e))?;
 
-        debug!("Pipeline request: {:?}", req);
+        let stmt_count = req.requests.len();
+        debug!(req_id = req_id, statements = stmt_count, "pipeline request");
 
+        let lock_start = Instant::now();
         let conn = self.conn.lock().unwrap();
+        let lock_ms = lock_start.elapsed().as_millis();
+        if lock_ms > SLOW_LOCK_THRESHOLD_MS {
+            warn!(
+                req_id = req_id,
+                lock_wait_ms = lock_ms as u64,
+                "slow lock acquisition in pipeline"
+            );
+        }
 
+        let exec_start = Instant::now();
         let mut results = Vec::new();
 
         for request in req.requests {
@@ -218,6 +364,9 @@ impl TursoSyncServer {
             };
             results.push(result);
         }
+        let exec_elapsed = exec_start.elapsed();
+
+        drop(conn);
 
         let resp = PipelineRespBody {
             baton: req.baton,
@@ -226,6 +375,15 @@ impl TursoSyncServer {
         };
 
         let body = serde_json::to_vec(&resp)?;
+
+        debug!(
+            req_id = req_id,
+            statements = stmt_count,
+            lock_ms = lock_ms as u64,
+            exec_ms = exec_elapsed.as_millis() as u64,
+            response_bytes = body.len(),
+            "pipeline complete"
+        );
 
         Ok(HttpResponse {
             status: 200,
@@ -252,7 +410,7 @@ impl TursoSyncServer {
         let mut stmt = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(e) => {
-                error!("Failed to prepare statement: {}", e);
+                error!(sql = %sql, error = %e, "prepare failed");
                 return StreamResult::Error {
                     error: Error {
                         message: e.to_string(),
@@ -310,7 +468,7 @@ impl TursoSyncServer {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to execute statement: {}", e);
+                    error!(sql = %sql, error = %e, "execute failed");
                     StreamResult::Error {
                         error: Error {
                             message: e.to_string(),
@@ -336,7 +494,7 @@ impl TursoSyncServer {
                     }),
                 },
                 Err(e) => {
-                    error!("Failed to execute statement: {}", e);
+                    error!(sql = %sql, error = %e, "execute (no rows) failed");
                     StreamResult::Error {
                         error: Error {
                             message: e.to_string(),
@@ -367,7 +525,7 @@ impl TursoSyncServer {
                         step_errors.push(None);
                     }
                     Err(e) => {
-                        error!("Batch step {} failed: {}", step_idx, e);
+                        error!(step = step_idx, error = %e, "batch step failed");
                         step_results.push(None);
                         step_errors.push(Some(Error {
                             message: e.to_string(),
@@ -483,14 +641,27 @@ impl TursoSyncServer {
         }
     }
 
-    fn handle_pull_updates(&self, body: &[u8]) -> Result<HttpResponse> {
+    fn handle_pull_updates(&self, body: &[u8], req_id: u64) -> Result<HttpResponse> {
         let req = <PullUpdatesReqProtoBody as Message>::decode(body)
             .map_err(|e| anyhow!("Failed to decode PullUpdatesRequest: {}", e))?;
 
-        debug!(
-            "Pull updates request: server_revision={}, client_revision={}",
-            req.server_revision, req.client_revision
+        let client_revision_raw = req.client_revision.clone();
+        let server_revision_raw = req.server_revision.clone();
+        let is_bootstrap = client_revision_raw.is_empty() || client_revision_raw == "0";
+
+        info!(
+            req_id = req_id,
+            client_revision = %client_revision_raw,
+            server_revision = %server_revision_raw,
+            is_bootstrap = is_bootstrap,
+            body_bytes = body.len(),
+            has_page_selector = !req.server_pages_selector.is_empty(),
+            "pull-updates request"
         );
+
+        if is_bootstrap {
+            self.total_bootstraps.fetch_add(1, Ordering::Relaxed);
+        }
 
         let encoding =
             PageUpdatesEncodingReq::try_from(req.encoding).unwrap_or(PageUpdatesEncodingReq::Raw);
@@ -502,21 +673,40 @@ impl TursoSyncServer {
         if PullUpdatesStreamKind::try_from(req.stream_kind).unwrap_or(PullUpdatesStreamKind::Pages)
             == PullUpdatesStreamKind::MvccLogicalLog
         {
-            return self.handle_logical_pull_updates(&req);
+            return self.handle_logical_pull_updates(&req, req_id);
         }
 
-        self.handle_page_pull_updates(&req, PullUpdatesApplyMode::Incremental)
+        self.handle_page_pull_updates(&req, PullUpdatesApplyMode::Incremental, req_id)
     }
 
     fn handle_page_pull_updates(
         &self,
         req: &PullUpdatesReqProtoBody,
         apply_mode: PullUpdatesApplyMode,
+        req_id: u64,
     ) -> Result<HttpResponse> {
+        let lock_start = Instant::now();
         let conn = self.conn.lock().unwrap();
+        let lock_ms = lock_start.elapsed().as_millis();
+        if lock_ms > SLOW_LOCK_THRESHOLD_MS {
+            warn!(
+                req_id = req_id,
+                lock_wait_ms = lock_ms as u64,
+                "slow lock acquisition in pull-updates"
+            );
+        }
 
+        let wal_start = Instant::now();
         let wal_state = conn.wal_state()?;
-        debug!("WAL state: max_frame={}", wal_state.max_frame);
+        let wal_ms = wal_start.elapsed().as_millis();
+
+        info!(
+            req_id = req_id,
+            wal_max_frame = wal_state.max_frame,
+            lock_wait_ms = lock_ms as u64,
+            wal_read_ms = wal_ms as u64,
+            "pull-updates: WAL state"
+        );
 
         let server_revision: u64 = if req.server_revision.is_empty() {
             wal_state.max_frame
@@ -530,9 +720,12 @@ impl TursoSyncServer {
             req.client_revision.parse().unwrap_or(0)
         };
 
-        debug!(
-            "Using server_revision={}, client_revision={}",
-            server_revision, client_revision
+        info!(
+            req_id = req_id,
+            server_revision = server_revision,
+            client_revision = client_revision,
+            frames_to_scan = server_revision.saturating_sub(client_revision),
+            "pull-updates: revision range"
         );
 
         let pages_selector: Option<RoaringBitmap> = if !req.server_pages_selector.is_empty() {
@@ -557,21 +750,41 @@ impl TursoSyncServer {
             client_revision,
             server_revision
         );
+        let wal_scan_start = Instant::now();
+        let mut wal_frames_scanned: u64 = 0;
+        let mut wal_frames_deduped: u64 = 0;
+        let mut wal_frames_filtered: u64 = 0;
+        let mut wal_frame_errors: u64 = 0;
 
         if server_revision > client_revision {
             for frame_no in (client_revision + 1..=server_revision).rev() {
-                let frame_info = conn.wal_get_frame(frame_no, &mut frame_buffer)?;
+                wal_frames_scanned += 1;
+                let frame_info = match conn.wal_get_frame(frame_no, &mut frame_buffer) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        wal_frame_errors += 1;
+                        error!(
+                            req_id = req_id,
+                            frame_no = frame_no,
+                            error = %e,
+                            "pull-updates: wal_get_frame failed"
+                        );
+                        continue;
+                    }
+                };
 
                 let page_no = frame_info.page_no;
                 // WAL uses 1-based page numbers, sync protocol uses 0-based
                 let page_id = page_no - 1;
 
                 if seen_pages.contains(&page_no) {
+                    wal_frames_deduped += 1;
                     continue;
                 }
 
                 if let Some(ref selector) = pages_selector {
                     if !selector.contains(page_id) {
+                        wal_frames_filtered += 1;
                         continue;
                     }
                 }
@@ -588,6 +801,19 @@ impl TursoSyncServer {
                 pages_to_send.push((page_id, page_data));
             }
         }
+        let wal_scan_ms = wal_scan_start.elapsed().as_millis();
+
+        let wal_pages_collected = seen_pages.len();
+        info!(
+            req_id = req_id,
+            wal_frames_scanned = wal_frames_scanned,
+            wal_pages_unique = wal_pages_collected,
+            wal_frames_deduped = wal_frames_deduped,
+            wal_frames_filtered = wal_frames_filtered,
+            wal_frame_errors = wal_frame_errors,
+            wal_scan_ms = wal_scan_ms as u64,
+            "pull-updates: WAL scan complete"
+        );
 
         debug!(
             "pull-updates: sending {} pages, seen_pages={:?}",
@@ -603,7 +829,16 @@ impl TursoSyncServer {
         // falls back to main.db. This fixes bootstrap after WAL checkpoint or
         // tursodb restart, where checkpointed pages exist only in main.db.
         if client_revision == 0 {
+            let bootstrap_start = Instant::now();
             let total_pages = db_size as u32;
+
+            info!(
+                req_id = req_id,
+                total_pages = total_pages,
+                db_size_pages = db_size,
+                pages_from_wal = wal_pages_collected,
+                "pull-updates: bootstrap started"
+            );
 
             if total_pages > 0 {
                 let missing: Vec<u32> = (1..=total_pages)
@@ -617,21 +852,75 @@ impl TursoSyncServer {
                     })
                     .collect();
 
+                let missing_count = missing.len();
+                let mut read_ok: u64 = 0;
+                let mut read_fail: u64 = 0;
+
                 if !missing.is_empty() {
-                    debug!(
-                        "Bootstrap: serving {} pages from database ({} from WAL, {} total)",
-                        missing.len(),
-                        seen_pages.len(),
-                        total_pages
+                    info!(
+                        req_id = req_id,
+                        missing_pages = missing_count,
+                        pages_from_wal = wal_pages_collected,
+                        total_pages = total_pages,
+                        "pull-updates: bootstrap reading from main.db"
                     );
                     for page_no in missing {
                         let mut page_data = vec![0u8; PAGE_SIZE];
-                        if conn.read_page_raw(page_no, &mut page_data).is_ok() {
-                            let page_id = page_no - 1;
-                            pages_to_send.push((page_id, page_data));
+                        match conn.read_page_raw(page_no, &mut page_data) {
+                            Ok(_) => {
+                                let page_id = page_no - 1;
+                                pages_to_send.push((page_id, page_data));
+                                read_ok += 1;
+                            }
+                            Err(e) => {
+                                read_fail += 1;
+                                error!(
+                                    req_id = req_id,
+                                    page_no = page_no,
+                                    error = %e,
+                                    "pull-updates: read_page_raw failed during bootstrap"
+                                );
+                            }
                         }
                     }
                 }
+
+                let bootstrap_ms = bootstrap_start.elapsed().as_millis();
+                info!(
+                    req_id = req_id,
+                    total_pages = total_pages,
+                    pages_from_wal = wal_pages_collected,
+                    pages_from_db = read_ok,
+                    pages_read_failed = read_fail,
+                    total_pages_sending = pages_to_send.len(),
+                    bootstrap_ms = bootstrap_ms as u64,
+                    "pull-updates: bootstrap complete"
+                );
+
+                if read_fail > 0 {
+                    warn!(
+                        req_id = req_id,
+                        read_failures = read_fail,
+                        total_pages = total_pages,
+                        "pull-updates: bootstrap had page read failures — client may receive incomplete database"
+                    );
+                }
+
+                if (read_ok as usize + wal_pages_collected) < total_pages as usize {
+                    warn!(
+                        req_id = req_id,
+                        pages_served = read_ok as usize + wal_pages_collected,
+                        total_pages = total_pages,
+                        gap = total_pages as usize - (read_ok as usize + wal_pages_collected),
+                        "pull-updates: bootstrap sending FEWER pages than total — client will have gaps"
+                    );
+                }
+            } else {
+                warn!(
+                    req_id = req_id,
+                    db_size = db_size,
+                    "pull-updates: bootstrap requested but total_pages=0 — empty database?"
+                );
             }
         }
 
@@ -659,6 +948,7 @@ impl TursoSyncServer {
         let header_bytes = header.encode_to_vec();
         encode_length_delimited(&mut response_body, &header_bytes);
 
+        let pages_sending = pages_to_send.len();
         for (page_id, page_data) in pages_to_send {
             let page_msg = PageData {
                 page_id: page_id as u64,
@@ -668,9 +958,14 @@ impl TursoSyncServer {
             encode_length_delimited(&mut response_body, &page_bytes);
         }
 
-        debug!(
-            "Sending {} bytes in pull-updates response",
-            response_body.len()
+        info!(
+            req_id = req_id,
+            pages_sent = pages_sending,
+            response_bytes = response_body.len(),
+            server_revision = server_revision,
+            db_size_pages = db_size,
+            client_revision = client_revision,
+            "pull-updates: response ready"
         );
 
         Ok(HttpResponse {
@@ -680,7 +975,11 @@ impl TursoSyncServer {
         })
     }
 
-    fn handle_logical_pull_updates(&self, req: &PullUpdatesReqProtoBody) -> Result<HttpResponse> {
+    fn handle_logical_pull_updates(
+        &self,
+        req: &PullUpdatesReqProtoBody,
+        req_id: u64,
+    ) -> Result<HttpResponse> {
         let (db_size, fallback_revision, legacy_current_revision) = {
             let conn = self.conn.lock().unwrap();
             let wal_state = conn.wal_state()?;
@@ -696,7 +995,11 @@ impl TursoSyncServer {
                 info!(
                     "logical pull requested for in-memory sync server database; returning incremental pages"
                 );
-                return self.handle_page_pull_updates(req, PullUpdatesApplyMode::Incremental);
+                return self.handle_page_pull_updates(
+                    req,
+                    PullUpdatesApplyMode::Incremental,
+                    req_id,
+                );
             }
             Err(err) => return Err(err),
         };
