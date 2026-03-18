@@ -63,6 +63,7 @@ impl TursoSyncServer {
         interrupt_count: Arc<AtomicUsize>,
     ) -> Result<Self> {
         conn.wal_auto_actions_disable();
+        info!("WAL automatic actions disabled for sync server connection");
 
         Ok(Self {
             address,
