@@ -943,11 +943,16 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn publish_backfill(&self, max_frame: u64) {
-        self.shared
-            .write()
+        let shared = self.shared.write();
+        shared
             .metadata
             .nbackfills
             .store(max_frame, Ordering::Release);
+        let mut frame_cache = shared.runtime.frame_cache.lock();
+        frame_cache.retain(|_page_id, frames| {
+            frames.retain(|&frame| frame > max_frame);
+            !frames.is_empty()
+        });
     }
 
     fn install_durable_backfill_proof(
@@ -1947,11 +1952,16 @@ impl WalCoordination for ShmWalCoordination {
     }
 
     fn publish_backfill(&self, max_frame: u64) {
-        self.shared
-            .write()
+        let shared = self.shared.write();
+        shared
             .metadata
             .nbackfills
             .store(max_frame, Ordering::Release);
+        let mut frame_cache = shared.runtime.frame_cache.lock();
+        frame_cache.retain(|_page_id, frames| {
+            frames.retain(|&frame| frame > max_frame);
+            !frames.is_empty()
+        });
         self.authority.publish_backfill(max_frame);
     }
 
@@ -6191,6 +6201,103 @@ pub mod test {
             bytes_after, 0,
             "Shutdown checkpoint should truncate WAL after RESTART, but WAL is {bytes_after} bytes",
         );
+    }
+
+    #[test]
+    fn test_frame_cache_shrinks_after_passive_checkpoint() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test (id integer primary key, value text)")
+            .unwrap();
+
+        bulk_inserts(&conn, 10, 5);
+
+        let frame_cache_total_frames = {
+            let shared = db.shared_wal.read();
+            let cache = shared.frame_cache.lock();
+            cache.values().map(|v| v.len()).sum::<usize>()
+        };
+        assert!(
+            frame_cache_total_frames > 0,
+            "frame_cache should have entries after inserts"
+        );
+
+        let pager = conn.pager.load();
+        let _ = pager.cacheflush();
+        run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: None,
+            },
+        );
+
+        let nbackfills = db.shared_wal.read().nbackfills.load(Ordering::Acquire);
+        assert!(nbackfills > 0, "checkpoint should have backfilled frames");
+
+        let stale_frames: Vec<u64> = {
+            let shared = db.shared_wal.read();
+            let cache = shared.frame_cache.lock();
+            cache
+                .values()
+                .flat_map(|v| v.iter().copied())
+                .filter(|&f| f <= nbackfills)
+                .collect()
+        };
+        assert!(
+            stale_frames.is_empty(),
+            "frame_cache should not contain frames <= nbackfills ({nbackfills}), found: {stale_frames:?}"
+        );
+
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn test_frame_cache_preserves_uncheckpointed_frames() {
+        let (db, path) = get_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table test (id integer primary key, value text)")
+            .unwrap();
+
+        bulk_inserts(&conn, 10, 5);
+
+        let pager = conn.pager.load();
+        let _ = pager.cacheflush();
+
+        let max_frame_before = db.shared_wal.read().max_frame.load(Ordering::Acquire);
+        assert!(
+            max_frame_before > 2,
+            "need enough frames for a partial checkpoint"
+        );
+
+        let partial_bound = max_frame_before / 2;
+        run_checkpoint_until_done(
+            &pager,
+            CheckpointMode::Passive {
+                upper_bound_inclusive: Some(partial_bound),
+            },
+        );
+
+        let nbackfills = db.shared_wal.read().nbackfills.load(Ordering::Acquire);
+        assert!(
+            nbackfills > 0 && nbackfills < max_frame_before,
+            "partial checkpoint should backfill some but not all frames"
+        );
+
+        let uncheckpointed_frames: Vec<u64> = {
+            let shared = db.shared_wal.read();
+            let cache = shared.frame_cache.lock();
+            cache
+                .values()
+                .flat_map(|v| v.iter().copied())
+                .filter(|&f| f > nbackfills)
+                .collect()
+        };
+        assert!(
+            !uncheckpointed_frames.is_empty(),
+            "frame_cache must retain frames beyond the checkpoint watermark (nbackfills={nbackfills})"
+        );
+
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     fn bulk_inserts(conn: &Arc<Connection>, n_txns: usize, rows_per_txn: usize) {
