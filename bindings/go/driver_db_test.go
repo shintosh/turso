@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
@@ -33,6 +34,84 @@ func openMem(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+func TestLocalMaintenanceConformance(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "owner.db")
+	db, err := sql.Open("turso", dbPath+"?experimental=vacuum")
+	require.NoError(t, err)
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE events(id INTEGER PRIMARY KEY, value TEXT)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "INSERT INTO events(value) VALUES ('before')")
+	require.NoError(t, err)
+
+	sqlConn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+
+	snapshotPath := filepath.Join(root, "snapshot.db")
+	err = sqlConn.Raw(func(driverConn any) error {
+		maintenance, ok := driverConn.(LocalMaintenance)
+		require.True(t, ok)
+
+		checkpoint, err := maintenance.Checkpoint(
+			t.Context(),
+			CheckpointRequest{Mode: CheckpointModeTruncate},
+		)
+		require.NoError(t, err)
+		require.Equal(t, MaintenanceCompleted, checkpoint.Result)
+
+		before, err := maintenance.PhysicalState(t.Context())
+		require.NoError(t, err)
+		require.Positive(t, before.PageSize)
+		require.Positive(t, before.PageCount)
+
+		snapshot, err := maintenance.Snapshot(
+			t.Context(),
+			SnapshotRequest{Destination: snapshotPath},
+		)
+		require.NoError(t, err)
+		require.Equal(t, MaintenanceCompleted, snapshot.Result)
+		require.NotEmpty(t, snapshot.SHA256)
+		require.Positive(t, snapshot.Bytes)
+
+		verified, err := maintenance.VerifyOffline(
+			t.Context(),
+			VerifyRequest{Path: snapshotPath, ExpectedSHA256: snapshot.SHA256},
+		)
+		require.NoError(t, err)
+		require.Equal(t, MaintenanceCompleted, verified.Result)
+
+		blocked, err := maintenance.Compact(
+			t.Context(),
+			CompactRequest{MaxSourcePages: 1},
+		)
+		require.NoError(t, err)
+		require.Equal(t, MaintenanceBudgetExceeded, blocked.Result)
+
+		compacted, err := maintenance.Compact(
+			t.Context(),
+			CompactRequest{MaxSourcePages: before.PageCount + before.FreelistPages + 1},
+		)
+		require.NoError(t, err)
+		require.Equal(t, MaintenanceCompleted, compacted.Result)
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, sqlConn.Close())
+
+	_, err = db.ExecContext(t.Context(), "INSERT INTO events(value) VALUES ('after')")
+	require.NoError(t, err)
+
+	snapshotDB, err := sql.Open("turso", snapshotPath)
+	require.NoError(t, err)
+	defer snapshotDB.Close()
+	var count int
+	require.NoError(t, snapshotDB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM events").Scan(&count))
+	require.Equal(t, 1, count)
 }
 
 func TestMain(m *testing.M) {

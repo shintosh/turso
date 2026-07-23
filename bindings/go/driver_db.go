@@ -2,13 +2,16 @@ package turso
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +35,7 @@ type tursoDbConnection struct {
 	db      TursoDatabase
 	conn    TursoConnection
 	extraIo func() error
+	path    string
 
 	mu          sync.Mutex
 	closed      bool
@@ -65,6 +69,79 @@ type tursoDbResult struct {
 type tursoDbTx struct {
 	conn *tursoDbConnection
 	done bool
+}
+
+type MaintenanceResult string
+
+const (
+	MaintenanceCompleted      MaintenanceResult = "completed"
+	MaintenanceBudgetExceeded MaintenanceResult = "budget_exceeded"
+)
+
+type CheckpointMode string
+
+const (
+	CheckpointModePassive  CheckpointMode = "passive"
+	CheckpointModeTruncate CheckpointMode = "truncate"
+)
+
+type CheckpointRequest struct {
+	Mode CheckpointMode
+}
+
+type CheckpointResult struct {
+	Result MaintenanceResult
+}
+
+type SnapshotRequest struct {
+	Destination string
+}
+
+type SnapshotResult struct {
+	Result MaintenanceResult
+	Path   string
+	Bytes  int64
+	SHA256 string
+}
+
+type VerifyRequest struct {
+	Path           string
+	ExpectedSHA256 string
+}
+
+type VerifyResult struct {
+	Result    MaintenanceResult
+	Bytes     int64
+	SHA256    string
+	PageSize  int64
+	PageCount int64
+}
+
+type CompactRequest struct {
+	MaxSourcePages int64
+}
+
+type CompactResult struct {
+	Result         MaintenanceResult
+	Before         PhysicalState
+	After          PhysicalState
+	ReclaimedBytes int64
+}
+
+type PhysicalState struct {
+	PageSize      int64
+	PageCount     int64
+	FreelistPages int64
+	MainBytes     int64
+	WALBytes      int64
+}
+
+type LocalMaintenance interface {
+	Checkpoint(context.Context, CheckpointRequest) (CheckpointResult, error)
+	Snapshot(context.Context, SnapshotRequest) (SnapshotResult, error)
+	VerifyOffline(context.Context, VerifyRequest) (VerifyResult, error)
+	Compact(context.Context, CompactRequest) (CompactResult, error)
+	PhysicalState(context.Context) (PhysicalState, error)
 }
 
 // register driver
@@ -123,6 +200,7 @@ func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 	return &tursoDbConnection{
 		db:          db,
 		conn:        c,
+		path:        config.Path,
 		busyTimeout: timeout,
 		async:       config.AsyncIO,
 	}, nil
@@ -337,6 +415,244 @@ func (c *tursoDbConnection) GetBusyTimeout() int {
 	return c.busyTimeout
 }
 
+func (c *tursoDbConnection) Checkpoint(ctx context.Context, request CheckpointRequest) (CheckpointResult, error) {
+	mode := request.Mode
+	if mode == "" {
+		mode = CheckpointModePassive
+	}
+	var query string
+	switch mode {
+	case CheckpointModePassive:
+		query = "PRAGMA wal_checkpoint(PASSIVE)"
+	case CheckpointModeTruncate:
+		query = "PRAGMA wal_checkpoint(TRUNCATE)"
+	default:
+		return CheckpointResult{}, fmt.Errorf("turso: invalid checkpoint mode %q", mode)
+	}
+	if err := c.execMaintenance(ctx, query); err != nil {
+		return CheckpointResult{}, err
+	}
+	return CheckpointResult{Result: MaintenanceCompleted}, nil
+}
+
+func (c *tursoDbConnection) Snapshot(ctx context.Context, request SnapshotRequest) (SnapshotResult, error) {
+	if strings.TrimSpace(request.Destination) == "" {
+		return SnapshotResult{}, errors.New("turso: snapshot destination is required")
+	}
+	if _, err := os.Stat(request.Destination); err == nil {
+		return SnapshotResult{}, errors.New("turso: snapshot destination already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return SnapshotResult{}, err
+	}
+	destination := strings.ReplaceAll(request.Destination, "'", "''")
+	if err := c.execMaintenance(ctx, "VACUUM INTO '"+destination+"'"); err != nil {
+		_ = os.Remove(request.Destination)
+		return SnapshotResult{}, err
+	}
+	bytes, digest, err := fileIdentity(request.Destination)
+	if err != nil {
+		return SnapshotResult{}, err
+	}
+	return SnapshotResult{
+		Result: MaintenanceCompleted,
+		Path:   request.Destination,
+		Bytes:  bytes,
+		SHA256: digest,
+	}, nil
+}
+
+func (c *tursoDbConnection) VerifyOffline(ctx context.Context, request VerifyRequest) (VerifyResult, error) {
+	if strings.TrimSpace(request.Path) == "" {
+		return VerifyResult{}, errors.New("turso: verification path is required")
+	}
+	bytes, digest, err := fileIdentity(request.Path)
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	if request.ExpectedSHA256 != "" && request.ExpectedSHA256 != digest {
+		return VerifyResult{}, errors.New("turso: snapshot digest differs")
+	}
+	db, err := sql.Open("turso", request.Path)
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	defer db.Close()
+	var integrity string
+	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil {
+		return VerifyResult{}, err
+	}
+	if integrity != "ok" {
+		return VerifyResult{}, fmt.Errorf("turso: integrity check failed: %s", integrity)
+	}
+	var pageSize, pageCount int64
+	if err := db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return VerifyResult{}, err
+	}
+	if err := db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return VerifyResult{}, err
+	}
+	return VerifyResult{
+		Result:    MaintenanceCompleted,
+		Bytes:     bytes,
+		SHA256:    digest,
+		PageSize:  pageSize,
+		PageCount: pageCount,
+	}, nil
+}
+
+func (c *tursoDbConnection) Compact(ctx context.Context, request CompactRequest) (CompactResult, error) {
+	if request.MaxSourcePages <= 0 {
+		return CompactResult{}, errors.New("turso: compact max source pages must be positive")
+	}
+	before, err := c.PhysicalState(ctx)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	if before.PageCount > request.MaxSourcePages {
+		return CompactResult{
+			Result: MaintenanceBudgetExceeded,
+			Before: before,
+			After:  before,
+		}, nil
+	}
+	if err := c.execMaintenance(ctx, "VACUUM"); err != nil {
+		return CompactResult{}, err
+	}
+	after, err := c.PhysicalState(ctx)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	reclaimed := before.MainBytes - after.MainBytes
+	if reclaimed < 0 {
+		reclaimed = 0
+	}
+	return CompactResult{
+		Result:         MaintenanceCompleted,
+		Before:         before,
+		After:          after,
+		ReclaimedBytes: reclaimed,
+	}, nil
+}
+
+func (c *tursoDbConnection) PhysicalState(ctx context.Context) (PhysicalState, error) {
+	if err := c.checkOpen(); err != nil {
+		return PhysicalState{}, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pageSize, err := c.queryInt64Locked(ctx, "PRAGMA page_size")
+	if err != nil {
+		return PhysicalState{}, err
+	}
+	pageCount, err := c.queryInt64Locked(ctx, "PRAGMA page_count")
+	if err != nil {
+		return PhysicalState{}, err
+	}
+	freelistPages, err := c.queryInt64Locked(ctx, "PRAGMA freelist_count")
+	if err != nil {
+		return PhysicalState{}, err
+	}
+	mainBytes, err := regularFileSize(c.path)
+	if err != nil {
+		return PhysicalState{}, err
+	}
+	walBytes, err := regularFileSize(c.path + "-wal")
+	if err != nil {
+		return PhysicalState{}, err
+	}
+	return PhysicalState{
+		PageSize:      pageSize,
+		PageCount:     pageCount,
+		FreelistPages: freelistPages,
+		MainBytes:     mainBytes,
+		WALBytes:      walBytes,
+	}, nil
+}
+
+func (c *tursoDbConnection) execMaintenance(ctx context.Context, query string) error {
+	if err := c.checkOpen(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stmt, err := turso_connection_prepare_single(c.conn, query)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	_, err = c.executeFully(ctx, stmt)
+	return err
+}
+
+func (c *tursoDbConnection) queryInt64Locked(ctx context.Context, query string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	stmt, err := turso_connection_prepare_single(c.conn, query)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	for {
+		status, err := turso_statement_step(stmt)
+		if err != nil {
+			return 0, err
+		}
+		switch status {
+		case TURSO_ROW:
+			return turso_statement_row_value_int(stmt, 0), nil
+		case TURSO_IO:
+			if c.extraIo != nil {
+				if err := c.extraIo(); err != nil {
+					return 0, err
+				}
+			}
+			if err := turso_statement_run_io(stmt); err != nil {
+				return 0, err
+			}
+		case TURSO_DONE:
+			return 0, errors.New("turso: maintenance query returned no row")
+		}
+	}
+}
+
+func fileIdentity(path string) (int64, string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	bytes, err := io.Copy(hash, file)
+	if err != nil {
+		return 0, "", err
+	}
+	return bytes, hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func regularFileSize(path string) (int64, error) {
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
+		return 0, nil
+	}
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
 // --- Connector Pattern ---
 
 // ConnectorOption configures a TursoConnector.
@@ -417,6 +733,7 @@ func (c *TursoConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	return &tursoDbConnection{
 		db:          db,
 		conn:        conn,
+		path:        config.Path,
 		busyTimeout: timeout,
 		async:       config.AsyncIO,
 	}, nil
