@@ -63,11 +63,15 @@ func TestLocalMaintenanceConformance(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.Equal(t, MaintenanceCompleted, checkpoint.Result)
+		require.Positive(t, checkpoint.Elapsed)
+		require.GreaterOrEqual(t, checkpoint.WALFrames, checkpoint.BackfilledFrames)
 
 		before, err := maintenance.PhysicalState(t.Context())
 		require.NoError(t, err)
 		require.Positive(t, before.PageSize)
 		require.Positive(t, before.PageCount)
+		require.NotEmpty(t, before.CheckpointState)
+		require.False(t, before.IncrementalVacuumEligible)
 
 		snapshot, err := maintenance.Snapshot(
 			t.Context(),
@@ -77,6 +81,7 @@ func TestLocalMaintenanceConformance(t *testing.T) {
 		require.Equal(t, MaintenanceCompleted, snapshot.Result)
 		require.NotEmpty(t, snapshot.SHA256)
 		require.Positive(t, snapshot.Bytes)
+		require.Positive(t, snapshot.Elapsed)
 
 		verified, err := maintenance.VerifyOffline(
 			t.Context(),
@@ -87,17 +92,34 @@ func TestLocalMaintenanceConformance(t *testing.T) {
 
 		blocked, err := maintenance.Compact(
 			t.Context(),
-			CompactRequest{MaxSourcePages: 1},
+			CompactRequest{MaxSourcePages: 1, MaxElapsed: time.Second},
 		)
 		require.NoError(t, err)
 		require.Equal(t, MaintenanceBudgetExceeded, blocked.Result)
+		require.Positive(t, blocked.Elapsed)
+
+		canceledContext, cancel := context.WithCancel(t.Context())
+		cancel()
+		canceled, err := maintenance.Compact(
+			canceledContext,
+			CompactRequest{
+				MaxSourcePages: before.PageCount + before.FreelistPages + 1,
+				MaxElapsed:     time.Second,
+			},
+		)
+		require.NoError(t, err)
+		require.Equal(t, MaintenanceCanceled, canceled.Result)
 
 		compacted, err := maintenance.Compact(
 			t.Context(),
-			CompactRequest{MaxSourcePages: before.PageCount + before.FreelistPages + 1},
+			CompactRequest{
+				MaxSourcePages: before.PageCount + before.FreelistPages + 1,
+				MaxElapsed:     time.Second,
+			},
 		)
 		require.NoError(t, err)
 		require.Equal(t, MaintenanceCompleted, compacted.Result)
+		require.Positive(t, compacted.Elapsed)
 		return nil
 	})
 	require.NoError(t, err)

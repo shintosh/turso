@@ -76,6 +76,10 @@ type MaintenanceResult string
 const (
 	MaintenanceCompleted      MaintenanceResult = "completed"
 	MaintenanceBudgetExceeded MaintenanceResult = "budget_exceeded"
+	MaintenanceBusy           MaintenanceResult = "busy"
+	MaintenanceCanceled       MaintenanceResult = "canceled"
+	MaintenanceNoOp           MaintenanceResult = "no_op"
+	MaintenanceUnsupported    MaintenanceResult = "unsupported_mode"
 )
 
 type CheckpointMode string
@@ -90,7 +94,11 @@ type CheckpointRequest struct {
 }
 
 type CheckpointResult struct {
-	Result MaintenanceResult
+	Result           MaintenanceResult
+	WALFrames        int64
+	BackfilledFrames int64
+	Busy             bool
+	Elapsed          time.Duration
 }
 
 type SnapshotRequest struct {
@@ -98,10 +106,11 @@ type SnapshotRequest struct {
 }
 
 type SnapshotResult struct {
-	Result MaintenanceResult
-	Path   string
-	Bytes  int64
-	SHA256 string
+	Result  MaintenanceResult
+	Path    string
+	Bytes   int64
+	SHA256  string
+	Elapsed time.Duration
 }
 
 type VerifyRequest struct {
@@ -119,6 +128,7 @@ type VerifyResult struct {
 
 type CompactRequest struct {
 	MaxSourcePages int64
+	MaxElapsed     time.Duration
 }
 
 type CompactResult struct {
@@ -126,14 +136,17 @@ type CompactResult struct {
 	Before         PhysicalState
 	After          PhysicalState
 	ReclaimedBytes int64
+	Elapsed        time.Duration
 }
 
 type PhysicalState struct {
-	PageSize      int64
-	PageCount     int64
-	FreelistPages int64
-	MainBytes     int64
-	WALBytes      int64
+	PageSize                  int64
+	PageCount                 int64
+	FreelistPages             int64
+	MainBytes                 int64
+	WALBytes                  int64
+	CheckpointState           string
+	IncrementalVacuumEligible bool
 }
 
 type LocalMaintenance interface {
@@ -416,6 +429,7 @@ func (c *tursoDbConnection) GetBusyTimeout() int {
 }
 
 func (c *tursoDbConnection) Checkpoint(ctx context.Context, request CheckpointRequest) (CheckpointResult, error) {
+	started := time.Now()
 	mode := request.Mode
 	if mode == "" {
 		mode = CheckpointModePassive
@@ -429,13 +443,26 @@ func (c *tursoDbConnection) Checkpoint(ctx context.Context, request CheckpointRe
 	default:
 		return CheckpointResult{}, fmt.Errorf("turso: invalid checkpoint mode %q", mode)
 	}
-	if err := c.execMaintenance(ctx, query); err != nil {
+	values, err := c.queryInt64s(ctx, query, 3)
+	if err != nil {
 		return CheckpointResult{}, err
 	}
-	return CheckpointResult{Result: MaintenanceCompleted}, nil
+	result := MaintenanceCompleted
+	busy := values[0] != 0
+	if busy {
+		result = MaintenanceBusy
+	}
+	return CheckpointResult{
+		Result:           result,
+		WALFrames:        values[1],
+		BackfilledFrames: values[2],
+		Busy:             busy,
+		Elapsed:          time.Since(started),
+	}, nil
 }
 
 func (c *tursoDbConnection) Snapshot(ctx context.Context, request SnapshotRequest) (SnapshotResult, error) {
+	started := time.Now()
 	if strings.TrimSpace(request.Destination) == "" {
 		return SnapshotResult{}, errors.New("turso: snapshot destination is required")
 	}
@@ -454,10 +481,11 @@ func (c *tursoDbConnection) Snapshot(ctx context.Context, request SnapshotReques
 		return SnapshotResult{}, err
 	}
 	return SnapshotResult{
-		Result: MaintenanceCompleted,
-		Path:   request.Destination,
-		Bytes:  bytes,
-		SHA256: digest,
+		Result:  MaintenanceCompleted,
+		Path:    request.Destination,
+		Bytes:   bytes,
+		SHA256:  digest,
+		Elapsed: time.Since(started),
 	}, nil
 }
 
@@ -501,25 +529,54 @@ func (c *tursoDbConnection) VerifyOffline(ctx context.Context, request VerifyReq
 }
 
 func (c *tursoDbConnection) Compact(ctx context.Context, request CompactRequest) (CompactResult, error) {
+	started := time.Now()
 	if request.MaxSourcePages <= 0 {
 		return CompactResult{}, errors.New("turso: compact max source pages must be positive")
 	}
-	before, err := c.PhysicalState(ctx)
+	if request.MaxElapsed <= 0 {
+		return CompactResult{}, errors.New("turso: compact max elapsed must be positive")
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, request.MaxElapsed)
+	defer cancel()
+	before, err := c.PhysicalState(operationCtx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return CompactResult{
+				Result:  MaintenanceCanceled,
+				Elapsed: time.Since(started),
+			}, nil
+		}
 		return CompactResult{}, err
 	}
 	if before.PageCount > request.MaxSourcePages {
 		return CompactResult{
-			Result: MaintenanceBudgetExceeded,
-			Before: before,
-			After:  before,
+			Result:  MaintenanceBudgetExceeded,
+			Before:  before,
+			After:   before,
+			Elapsed: time.Since(started),
 		}, nil
 	}
-	if err := c.execMaintenance(ctx, "VACUUM"); err != nil {
+	if err := c.execMaintenance(operationCtx, "VACUUM"); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return CompactResult{
+				Result:  MaintenanceCanceled,
+				Before:  before,
+				After:   before,
+				Elapsed: time.Since(started),
+			}, nil
+		}
 		return CompactResult{}, err
 	}
-	after, err := c.PhysicalState(ctx)
+	after, err := c.PhysicalState(operationCtx)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return CompactResult{
+				Result:  MaintenanceCanceled,
+				Before:  before,
+				After:   before,
+				Elapsed: time.Since(started),
+			}, nil
+		}
 		return CompactResult{}, err
 	}
 	reclaimed := before.MainBytes - after.MainBytes
@@ -531,6 +588,7 @@ func (c *tursoDbConnection) Compact(ctx context.Context, request CompactRequest)
 		Before:         before,
 		After:          after,
 		ReclaimedBytes: reclaimed,
+		Elapsed:        time.Since(started),
 	}, nil
 }
 
@@ -560,13 +618,28 @@ func (c *tursoDbConnection) PhysicalState(ctx context.Context) (PhysicalState, e
 	if err != nil {
 		return PhysicalState{}, err
 	}
+	checkpointState := "pending"
+	if walBytes == 0 {
+		checkpointState = "clean"
+	}
 	return PhysicalState{
-		PageSize:      pageSize,
-		PageCount:     pageCount,
-		FreelistPages: freelistPages,
-		MainBytes:     mainBytes,
-		WALBytes:      walBytes,
+		PageSize:                  pageSize,
+		PageCount:                 pageCount,
+		FreelistPages:             freelistPages,
+		MainBytes:                 mainBytes,
+		WALBytes:                  walBytes,
+		CheckpointState:           checkpointState,
+		IncrementalVacuumEligible: false,
 	}, nil
+}
+
+func (c *tursoDbConnection) queryInt64s(ctx context.Context, query string, count int) ([]int64, error) {
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.queryInt64sLocked(ctx, query, count)
 }
 
 func (c *tursoDbConnection) execMaintenance(ctx context.Context, query string) error {
@@ -591,12 +664,20 @@ func (c *tursoDbConnection) execMaintenance(ctx context.Context, query string) e
 }
 
 func (c *tursoDbConnection) queryInt64Locked(ctx context.Context, query string) (int64, error) {
-	if err := ctx.Err(); err != nil {
+	values, err := c.queryInt64sLocked(ctx, query, 1)
+	if err != nil {
 		return 0, err
+	}
+	return values[0], nil
+}
+
+func (c *tursoDbConnection) queryInt64sLocked(ctx context.Context, query string, count int) ([]int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	stmt, err := turso_connection_prepare_single(c.conn, query)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer func() {
 		_ = turso_statement_finalize(stmt)
@@ -605,22 +686,26 @@ func (c *tursoDbConnection) queryInt64Locked(ctx context.Context, query string) 
 	for {
 		status, err := turso_statement_step(stmt)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		switch status {
 		case TURSO_ROW:
-			return turso_statement_row_value_int(stmt, 0), nil
+			values := make([]int64, count)
+			for index := range count {
+				values[index] = turso_statement_row_value_int(stmt, index)
+			}
+			return values, nil
 		case TURSO_IO:
 			if c.extraIo != nil {
 				if err := c.extraIo(); err != nil {
-					return 0, err
+					return nil, err
 				}
 			}
 			if err := turso_statement_run_io(stmt); err != nil {
-				return 0, err
+				return nil, err
 			}
 		case TURSO_DONE:
-			return 0, errors.New("turso: maintenance query returned no row")
+			return nil, errors.New("turso: maintenance query returned no row")
 		}
 	}
 }
