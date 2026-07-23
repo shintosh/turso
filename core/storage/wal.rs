@@ -6217,7 +6217,7 @@ pub mod test {
 
         let frame_cache_total_frames = {
             let shared = db.shared_wal.read();
-            let cache = shared.frame_cache.lock();
+            let cache = shared.runtime.frame_cache.lock();
             cache.values().map(|v| v.len()).sum::<usize>()
         };
         assert!(
@@ -6234,12 +6234,17 @@ pub mod test {
             },
         );
 
-        let nbackfills = db.shared_wal.read().nbackfills.load(Ordering::Acquire);
+        let nbackfills = db
+            .shared_wal
+            .read()
+            .metadata
+            .nbackfills
+            .load(Ordering::Acquire);
         assert!(nbackfills > 0, "checkpoint should have backfilled frames");
 
         let stale_frames: Vec<u64> = {
             let shared = db.shared_wal.read();
-            let cache = shared.frame_cache.lock();
+            let cache = shared.runtime.frame_cache.lock();
             cache
                 .values()
                 .flat_map(|v| v.iter().copied())
@@ -6266,7 +6271,12 @@ pub mod test {
         let pager = conn.pager.load();
         let _ = pager.cacheflush();
 
-        let max_frame_before = db.shared_wal.read().max_frame.load(Ordering::Acquire);
+        let max_frame_before = db
+            .shared_wal
+            .read()
+            .metadata
+            .max_frame
+            .load(Ordering::Acquire);
         assert!(
             max_frame_before > 2,
             "need enough frames for a partial checkpoint"
@@ -6280,7 +6290,12 @@ pub mod test {
             },
         );
 
-        let nbackfills = db.shared_wal.read().nbackfills.load(Ordering::Acquire);
+        let nbackfills = db
+            .shared_wal
+            .read()
+            .metadata
+            .nbackfills
+            .load(Ordering::Acquire);
         assert!(
             nbackfills > 0 && nbackfills < max_frame_before,
             "partial checkpoint should backfill some but not all frames"
@@ -6288,7 +6303,7 @@ pub mod test {
 
         let uncheckpointed_frames: Vec<u64> = {
             let shared = db.shared_wal.read();
-            let cache = shared.frame_cache.lock();
+            let cache = shared.runtime.frame_cache.lock();
             cache
                 .values()
                 .flat_map(|v| v.iter().copied())
