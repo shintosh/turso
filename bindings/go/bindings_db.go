@@ -285,7 +285,7 @@ func decodeAndFreeCStringRaw(p uintptr) string {
 	}
 	s := string(unsafe.Slice((*byte)(unsafe.Pointer(p)), n))
 	// free C-allocated string
-	c_turso_str_deinit(p)
+	withNativeCallVoid(func() { c_turso_str_deinit(p) })
 	return s
 }
 
@@ -356,7 +356,7 @@ func turso_setup(config TursoConfig) error {
 	var levelBytes []byte
 	levelBytes, cconf.log_level = makeCStringBytes(config.LogLevel)
 	var errPtr *byte
-	status := c_turso_setup(&cconf, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_setup(&cconf, &errPtr) })
 	// Keep Go memory alive during C call
 	runtime.KeepAlive(levelBytes)
 	if status == int32(TURSO_OK) {
@@ -394,7 +394,7 @@ func turso_database_new(config TursoDatabaseConfig) (TursoDatabase, error) {
 
 	var db *turso_database_t
 	var errPtr *byte
-	status := c_turso_database_new(&cconf, &db, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_database_new(&cconf, &db, &errPtr) })
 	runtime.KeepAlive(pathBytes)
 	runtime.KeepAlive(expBytes)
 	runtime.KeepAlive(vfsBytes)
@@ -410,7 +410,7 @@ func turso_database_new(config TursoDatabaseConfig) (TursoDatabase, error) {
 // turso_database_open opens the database.
 func turso_database_open(database TursoDatabase) error {
 	var errPtr *byte
-	status := c_turso_database_open(database, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_database_open(database, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -422,7 +422,7 @@ func turso_database_open(database TursoDatabase) error {
 func turso_database_connect(self TursoDatabase) (TursoConnection, error) {
 	var conn *turso_connection_t
 	var errPtr *byte
-	status := c_turso_database_connect(self, &conn, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_database_connect(self, &conn, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoConnection(conn), nil
 	}
@@ -432,24 +432,24 @@ func turso_database_connect(self TursoDatabase) (TursoConnection, error) {
 
 // turso_connection_get_autocommit returns the autocommit state of the connection.
 func turso_connection_get_autocommit(self TursoConnection) bool {
-	return c_turso_connection_get_autocommit(self)
+	return withNativeCall(func() bool { return c_turso_connection_get_autocommit(self) })
 }
 
 // turso_connection_set_busy_timeout_ms sets busy timeout for the connection
 func turso_connection_set_busy_timeout_ms(self TursoConnection, timeoutMs int64) {
-	c_turso_connection_set_busy_timeout_ms(self, timeoutMs)
+	withNativeCallVoid(func() { c_turso_connection_set_busy_timeout_ms(self, timeoutMs) })
 }
 
 // turso_connection_last_insert_rowid returns last insert rowid.
 func turso_connection_last_insert_rowid(self TursoConnection) int64 {
-	return c_turso_connection_last_insert_rowid(self)
+	return withNativeCall(func() int64 { return c_turso_connection_last_insert_rowid(self) })
 }
 
 // turso_connection_prepare_single prepares a single statement in a connection.
 func turso_connection_prepare_single(self TursoConnection, sql string) (TursoStatement, error) {
 	var stmt *turso_statement_t
 	var errPtr *byte
-	status := c_turso_connection_prepare_single(self, sql, &stmt, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_connection_prepare_single(self, sql, &stmt, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoStatement(stmt), nil
 	}
@@ -462,7 +462,7 @@ func turso_connection_prepare_first(self TursoConnection, sql string) (TursoStat
 	var stmt *turso_statement_t
 	var tail uintptr
 	var errPtr *byte
-	status := c_turso_connection_prepare_first(self, sql, &stmt, &tail, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_connection_prepare_first(self, sql, &stmt, &tail, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoStatement(stmt), int(tail), nil
 	}
@@ -473,7 +473,7 @@ func turso_connection_prepare_first(self TursoConnection, sql string) (TursoStat
 // turso_connection_close closes the connection preventing any further operations.
 func turso_connection_close(self TursoConnection) error {
 	var errPtr *byte
-	status := c_turso_connection_close(self, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_connection_close(self, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -487,7 +487,7 @@ func turso_connection_close(self TursoConnection) error {
 func turso_statement_execute(self TursoStatement) (TursoStatusCode, uint64, error) {
 	var changes uint64
 	var errPtr *byte
-	status := c_turso_statement_execute(self, &changes, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_execute(self, &changes, &errPtr) })
 	switch TursoStatusCode(status) {
 	case TURSO_OK, TURSO_DONE, TURSO_ROW, TURSO_IO:
 		return TursoStatusCode(status), changes, nil
@@ -500,7 +500,7 @@ func turso_statement_execute(self TursoStatement) (TursoStatusCode, uint64, erro
 // turso_statement_step steps statement execution once. Returns DONE, ROW, IO, or error.
 func turso_statement_step(self TursoStatement) (TursoStatusCode, error) {
 	var errPtr *byte
-	status := c_turso_statement_step(self, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_step(self, &errPtr) })
 	switch TursoStatusCode(status) {
 	case TURSO_OK, TURSO_DONE, TURSO_ROW, TURSO_IO:
 		return TursoStatusCode(status), nil
@@ -513,7 +513,7 @@ func turso_statement_step(self TursoStatement) (TursoStatusCode, error) {
 // turso_statement_run_io executes one iteration of underlying IO backend after TURSO_IO.
 func turso_statement_run_io(self TursoStatement) error {
 	var errPtr *byte
-	status := c_turso_statement_run_io(self, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_run_io(self, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -526,7 +526,7 @@ func turso_statement_run_io(self TursoStatement) error {
 // any pending execution will be aborted - be careful and in certain cases ensure that turso_statement_finalize called before turso_statement_reset
 func turso_statement_reset(self TursoStatement) error {
 	var errPtr *byte
-	status := c_turso_statement_reset(self, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_reset(self, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -537,7 +537,7 @@ func turso_statement_reset(self TursoStatement) error {
 // turso_statement_finalize finalizes a statement.
 func turso_statement_finalize(self TursoStatement) error {
 	var errPtr *byte
-	status := c_turso_statement_finalize(self, &errPtr)
+	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_finalize(self, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -547,18 +547,18 @@ func turso_statement_finalize(self TursoStatement) error {
 
 // turso_statement_n_change returns amount of row modifications (insert/delete operations) made by the most recent executed statement.
 func turso_statement_n_change(self TursoStatement) int64 {
-	return c_turso_statement_n_change(self)
+	return withNativeCall(func() int64 { return c_turso_statement_n_change(self) })
 }
 
 // turso_statement_column_count returns the number of columns.
 func turso_statement_column_count(self TursoStatement) int64 {
-	return c_turso_statement_column_count(self)
+	return withNativeCall(func() int64 { return c_turso_statement_column_count(self) })
 }
 
 // turso_statement_column_name returns the column name at the index.
 // The underlying C string is freed automatically.
 func turso_statement_column_name(self TursoStatement, index int) string {
-	ptr := c_turso_statement_column_name(self, uintptr(index))
+	ptr := withNativeCall(func() uintptr { return c_turso_statement_column_name(self, uintptr(index)) })
 	return decodeAndFreeCStringRaw(ptr)
 }
 
@@ -566,7 +566,7 @@ func turso_statement_column_name(self TursoStatement, index int) string {
 // (e.g. "INTEGER", "TEXT", "DATETIME", etc.). Returns empty string if not available.
 // The underlying C string is freed automatically.
 func turso_statement_column_decltype(self TursoStatement, index int) string {
-	ptr := c_turso_statement_column_decltype(self, uintptr(index))
+	ptr := withNativeCall(func() uintptr { return c_turso_statement_column_decltype(self, uintptr(index)) })
 	if ptr == 0 {
 		return ""
 	}
@@ -575,44 +575,44 @@ func turso_statement_column_decltype(self TursoStatement, index int) string {
 
 // turso_statement_row_value_kind returns the row value kind at index.
 func turso_statement_row_value_kind(self TursoStatement, index int) TursoType {
-	return TursoType(c_turso_statement_row_value_kind(self, uintptr(index)))
+	return TursoType(withNativeCall(func() int32 { return c_turso_statement_row_value_kind(self, uintptr(index)) }))
 }
 
 // turso_statement_row_value_bytes_count returns number of bytes for BLOB or TEXT, -1 otherwise.
 func turso_statement_row_value_bytes_count(self TursoStatement, index int) int64 {
-	return c_turso_statement_row_value_bytes_count(self, uintptr(index))
+	return withNativeCall(func() int64 { return c_turso_statement_row_value_bytes_count(self, uintptr(index)) })
 }
 
 // turso_statement_row_value_bytes_ptr returns pointer to start of BLOB/TEXT slice, or nil otherwise.
 func turso_statement_row_value_bytes_ptr(self TursoStatement, index int) uintptr {
-	return c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
+	return withNativeCall(func() uintptr { return c_turso_statement_row_value_bytes_ptr(self, uintptr(index)) })
 }
 
 // turso_statement_row_value_int returns INTEGER value at index, or 0 otherwise.
 func turso_statement_row_value_int(self TursoStatement, index int) int64 {
-	return c_turso_statement_row_value_int(self, uintptr(index))
+	return withNativeCall(func() int64 { return c_turso_statement_row_value_int(self, uintptr(index)) })
 }
 
 // turso_statement_row_value_double returns REAL value at index, or 0 otherwise.
 func turso_statement_row_value_double(self TursoStatement, index int) float64 {
-	return c_turso_statement_row_value_double(self, uintptr(index))
+	return withNativeCall(func() float64 { return c_turso_statement_row_value_double(self, uintptr(index)) })
 }
 
 // turso_statement_named_position returns named argument position in a statement.
 func turso_statement_named_position(self TursoStatement, name string) int64 {
-	return c_turso_statement_named_position(self, name)
+	return withNativeCall(func() int64 { return c_turso_statement_named_position(self, name) })
 }
 
 // turso_statement_parameters_count returns parameters count for the statement.
 func turso_statement_parameters_count(self TursoStatement) int64 {
-	return c_turso_statement_parameters_count(self)
+	return withNativeCall(func() int64 { return c_turso_statement_parameters_count(self) })
 }
 
 // turso_statement_parameter_name returns the name of the parameter at 1-based
 // index, including its SQL prefix (e.g. ":name", "@name", "$name").
 // Returns "" for positional-only parameters or out-of-range indices.
 func turso_statement_parameter_name(self TursoStatement, index int) string {
-	ptr := c_turso_statement_parameter_name(self, int64(index))
+	ptr := withNativeCall(func() uintptr { return c_turso_statement_parameter_name(self, int64(index)) })
 	if ptr == 0 {
 		return ""
 	}
@@ -621,7 +621,7 @@ func turso_statement_parameter_name(self TursoStatement, index int) string {
 
 // turso_statement_bind_positional_null binds a positional argument as NULL.
 func turso_statement_bind_positional_null(self TursoStatement, position int) error {
-	status := c_turso_statement_bind_positional_null(self, uintptr(position))
+	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_bind_positional_null(self, uintptr(position)) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -630,7 +630,9 @@ func turso_statement_bind_positional_null(self TursoStatement, position int) err
 
 // turso_statement_bind_positional_int binds a positional argument as INTEGER.
 func turso_statement_bind_positional_int(self TursoStatement, position int, value int64) error {
-	status := c_turso_statement_bind_positional_int(self, uintptr(position), value)
+	status := withNativeCall(func() turso_status_code_t {
+		return c_turso_statement_bind_positional_int(self, uintptr(position), value)
+	})
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -639,7 +641,9 @@ func turso_statement_bind_positional_int(self TursoStatement, position int, valu
 
 // turso_statement_bind_positional_double binds a positional argument as REAL.
 func turso_statement_bind_positional_double(self TursoStatement, position int, value float64) error {
-	status := c_turso_statement_bind_positional_double(self, uintptr(position), value)
+	status := withNativeCall(func() turso_status_code_t {
+		return c_turso_statement_bind_positional_double(self, uintptr(position), value)
+	})
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -654,7 +658,9 @@ func turso_statement_bind_positional_blob(self TursoStatement, position int, val
 		ptr = &value[0]
 		length = uintptr(len(value))
 	}
-	status := c_turso_statement_bind_positional_blob(self, uintptr(position), ptr, length)
+	status := withNativeCall(func() turso_status_code_t {
+		return c_turso_statement_bind_positional_blob(self, uintptr(position), ptr, length)
+	})
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -671,7 +677,9 @@ func turso_statement_bind_positional_text(self TursoStatement, position int, val
 		ptr = (*byte)(unsafe.Pointer(unsafe.StringData(value)))
 		length = uintptr(len(value))
 	}
-	status := c_turso_statement_bind_positional_text(self, uintptr(position), ptr, length)
+	status := withNativeCall(func() turso_status_code_t {
+		return c_turso_statement_bind_positional_text(self, uintptr(position), ptr, length)
+	})
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -681,29 +689,29 @@ func turso_statement_bind_positional_text(self TursoStatement, position int, val
 // turso_database_deinit deallocates and closes a database.
 // SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited database.
 func turso_database_deinit(self TursoDatabase) {
-	c_turso_database_deinit(self)
+	withNativeCallVoid(func() { c_turso_database_deinit(self) })
 }
 
 // turso_connection_deinit deallocates and closes a connection.
 // SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited connection.
 func turso_connection_deinit(self TursoConnection) {
-	c_turso_connection_deinit(self)
+	withNativeCallVoid(func() { c_turso_connection_deinit(self) })
 }
 
 // turso_statement_deinit deallocates and closes a statement.
 // SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited statement.
 func turso_statement_deinit(self TursoStatement) {
-	c_turso_statement_deinit(self)
+	withNativeCallVoid(func() { c_turso_statement_deinit(self) })
 }
 
 // Additional ergonomic helpers (the only non-direct translations):
 // turso_statement_row_value_bytes returns a copy of bytes for BLOB or TEXT values, nil otherwise.
 func turso_statement_row_value_bytes(self TursoStatement, index int) []byte {
-	n := c_turso_statement_row_value_bytes_count(self, uintptr(index))
+	n := withNativeCall(func() int64 { return c_turso_statement_row_value_bytes_count(self, uintptr(index)) })
 	if n <= 0 {
 		return nil
 	}
-	ptr := c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
+	ptr := withNativeCall(func() uintptr { return c_turso_statement_row_value_bytes_ptr(self, uintptr(index)) })
 	if ptr == 0 {
 		return nil
 	}
@@ -715,11 +723,11 @@ func turso_statement_row_value_bytes(self TursoStatement, index int) []byte {
 
 // turso_statement_row_value_text returns a copy of text for TEXT values, "" otherwise.
 func turso_statement_row_value_text(self TursoStatement, index int) string {
-	n := c_turso_statement_row_value_bytes_count(self, uintptr(index))
+	n := withNativeCall(func() int64 { return c_turso_statement_row_value_bytes_count(self, uintptr(index)) })
 	if n <= 0 {
 		return ""
 	}
-	ptr := c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
+	ptr := withNativeCall(func() uintptr { return c_turso_statement_row_value_bytes_ptr(self, uintptr(index)) })
 	if ptr == 0 {
 		return ""
 	}

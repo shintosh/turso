@@ -1,11 +1,51 @@
 package turso
 
 import (
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNativeCallCoordinatorSerializesAcrossHandles(t *testing.T) {
+	workers := max(2, runtime.GOMAXPROCS(0))
+	start := make(chan struct{})
+	release := make(chan struct{})
+	entered := make(chan struct{}, workers)
+	results := make(chan error, workers)
+	var active atomic.Int32
+	var workersReady sync.WaitGroup
+	workersReady.Add(workers)
+
+	for range workers {
+		go func() {
+			workersReady.Done()
+			<-start
+			withNativeCallVoid(func() {
+				if active.Add(1) != 1 {
+					results <- fmt.Errorf("native calls overlapped")
+					return
+				}
+				entered <- struct{}{}
+				<-release
+				active.Add(-1)
+			})
+			results <- nil
+		}()
+	}
+
+	workersReady.Wait()
+	close(start)
+	<-entered
+	close(release)
+	for range workers {
+		require.NoError(t, <-results)
+	}
+}
 
 type dbConn struct {
 	db   TursoDatabase

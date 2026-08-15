@@ -437,7 +437,7 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 
 	var db *turso_sync_database_t
 	var errPtr *byte
-	status := c_turso_sync_database_new(&cdb, &csync, &db, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_new(&cdb, &csync, &db, &errPtr) })
 
 	// Keep Go memory alive during C call
 	runtime.KeepAlive(pathBytes)
@@ -461,7 +461,7 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 func turso_sync_database_open(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_open(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_open(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -474,7 +474,7 @@ func turso_sync_database_open(self TursoSyncDatabase) (TursoSyncOperation, error
 func turso_sync_database_create(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_create(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_create(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -488,7 +488,7 @@ func turso_sync_database_create(self TursoSyncDatabase) (TursoSyncOperation, err
 func turso_sync_database_connect(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_connect(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_connect(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -501,7 +501,7 @@ func turso_sync_database_connect(self TursoSyncDatabase) (TursoSyncOperation, er
 func turso_sync_database_stats(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_stats(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_stats(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -514,7 +514,7 @@ func turso_sync_database_stats(self TursoSyncDatabase) (TursoSyncOperation, erro
 func turso_sync_database_checkpoint(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_checkpoint(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_checkpoint(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -527,7 +527,7 @@ func turso_sync_database_checkpoint(self TursoSyncDatabase) (TursoSyncOperation,
 func turso_sync_database_push_changes(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_push_changes(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_push_changes(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -540,7 +540,7 @@ func turso_sync_database_push_changes(self TursoSyncDatabase) (TursoSyncOperatio
 func turso_sync_database_wait_changes(self TursoSyncDatabase) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_wait_changes(self, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_wait_changes(self, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -558,7 +558,7 @@ func turso_sync_database_wait_changes(self TursoSyncDatabase) (TursoSyncOperatio
 func turso_sync_database_apply_changes(self TursoSyncDatabase, changes TursoSyncChanges) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
 	var errPtr *byte
-	status := c_turso_sync_database_apply_changes(self, changes, &op, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_apply_changes(self, changes, &op, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncOperation(op), nil
 	}
@@ -570,7 +570,7 @@ func turso_sync_database_apply_changes(self TursoSyncDatabase, changes TursoSync
 // Returns status code (OK/IO/DONE or error code) and error if any.
 func turso_sync_operation_resume(self TursoSyncOperation) (TursoStatusCode, error) {
 	var errPtr *byte
-	status := c_turso_sync_operation_resume(self, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_operation_resume(self, &errPtr) })
 	switch TursoStatusCode(status) {
 	case TURSO_OK, TURSO_IO, TURSO_DONE:
 		return TursoStatusCode(status), nil
@@ -582,13 +582,13 @@ func turso_sync_operation_resume(self TursoSyncOperation) (TursoStatusCode, erro
 
 // turso_sync_operation_result_kind extracts operation result kind.
 func turso_sync_operation_result_kind(self TursoSyncOperation) TursoSyncOperationResultType {
-	return TursoSyncOperationResultType(c_turso_sync_operation_result_kind(self))
+	return TursoSyncOperationResultType(withNativeCall(func() int32 { return c_turso_sync_operation_result_kind(self) }))
 }
 
 // turso_sync_operation_result_extract_connection extracts Connection result from finished operation.
 func turso_sync_operation_result_extract_connection(self TursoSyncOperation) (TursoConnection, error) {
 	var conn *turso_connection_t
-	status := c_turso_sync_operation_result_extract_connection(self, &conn)
+	status := withNativeCall(func() int32 { return c_turso_sync_operation_result_extract_connection(self, &conn) })
 	if status == int32(TURSO_OK) {
 		return TursoConnection(conn), nil
 	}
@@ -599,7 +599,7 @@ func turso_sync_operation_result_extract_connection(self TursoSyncOperation) (Tu
 // If no changes were fetched - return TURSO_OK and set changes to null pointer
 func turso_sync_operation_result_extract_changes(self TursoSyncOperation) (TursoSyncChanges, error) {
 	var ch *turso_sync_changes_t
-	status := c_turso_sync_operation_result_extract_changes(self, &ch)
+	status := withNativeCall(func() int32 { return c_turso_sync_operation_result_extract_changes(self, &ch) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncChanges(ch), nil
 	}
@@ -609,7 +609,7 @@ func turso_sync_operation_result_extract_changes(self TursoSyncOperation) (Turso
 // turso_sync_operation_result_extract_stats extracts Stats result from finished operation.
 func turso_sync_operation_result_extract_stats(self TursoSyncOperation) (TursoSyncStats, error) {
 	var cstats turso_sync_stats_t
-	status := c_turso_sync_operation_result_extract_stats(self, &cstats)
+	status := withNativeCall(func() int32 { return c_turso_sync_operation_result_extract_stats(self, &cstats) })
 	if status != int32(TURSO_OK) {
 		return TursoSyncStats{}, statusToError(TursoStatusCode(status), "")
 	}
@@ -630,7 +630,7 @@ func turso_sync_operation_result_extract_stats(self TursoSyncOperation) (TursoSy
 func turso_sync_database_io_take_item(self TursoSyncDatabase) (TursoSyncIoItem, error) {
 	var item *turso_sync_io_item_t
 	var errPtr *byte
-	status := c_turso_sync_database_io_take_item(self, &item, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_take_item(self, &item, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return TursoSyncIoItem(item), nil
 	}
@@ -641,7 +641,7 @@ func turso_sync_database_io_take_item(self TursoSyncDatabase) (TursoSyncIoItem, 
 // turso_sync_database_io_step_callbacks runs extra database callbacks after IO execution.
 func turso_sync_database_io_step_callbacks(self TursoSyncDatabase) error {
 	var errPtr *byte
-	status := c_turso_sync_database_io_step_callbacks(self, &errPtr)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_step_callbacks(self, &errPtr) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -651,13 +651,13 @@ func turso_sync_database_io_step_callbacks(self TursoSyncDatabase) error {
 
 // turso_sync_database_io_request_kind returns the IO request kind.
 func turso_sync_database_io_request_kind(self TursoSyncIoItem) TursoSyncIoRequestType {
-	return TursoSyncIoRequestType(c_turso_sync_database_io_request_kind(self))
+	return TursoSyncIoRequestType(withNativeCall(func() int32 { return c_turso_sync_database_io_request_kind(self) }))
 }
 
 // turso_sync_database_io_request_http gets HTTP request fields for an IO item.
 func turso_sync_database_io_request_http(self TursoSyncIoItem) (TursoSyncIoHttpRequest, error) {
 	var creq turso_sync_io_http_request_t
-	status := c_turso_sync_database_io_request_http(self, &creq)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_request_http(self, &creq) })
 	if status != int32(TURSO_OK) {
 		return TursoSyncIoHttpRequest{}, statusToError(TursoStatusCode(status), "")
 	}
@@ -673,7 +673,7 @@ func turso_sync_database_io_request_http(self TursoSyncIoItem) (TursoSyncIoHttpR
 // turso_sync_database_io_request_http_header returns HTTP header key-value pair at index.
 func turso_sync_database_io_request_http_header(self TursoSyncIoItem, index int) (TursoSyncIoHttpHeader, error) {
 	var ch turso_sync_io_http_header_t
-	status := c_turso_sync_database_io_request_http_header(self, uintptr(index), &ch)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_request_http_header(self, uintptr(index), &ch) })
 	if status != int32(TURSO_OK) {
 		return TursoSyncIoHttpHeader{}, statusToError(TursoStatusCode(status), "")
 	}
@@ -686,7 +686,7 @@ func turso_sync_database_io_request_http_header(self TursoSyncIoItem, index int)
 // turso_sync_database_io_request_full_read returns atomic read request fields.
 func turso_sync_database_io_request_full_read(self TursoSyncIoItem) (TursoSyncIoFullReadRequest, error) {
 	var r turso_sync_io_full_read_request_t
-	status := c_turso_sync_database_io_request_full_read(self, &r)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_request_full_read(self, &r) })
 	if status != int32(TURSO_OK) {
 		return TursoSyncIoFullReadRequest{}, statusToError(TursoStatusCode(status), "")
 	}
@@ -696,7 +696,7 @@ func turso_sync_database_io_request_full_read(self TursoSyncIoItem) (TursoSyncIo
 // turso_sync_database_io_request_full_write returns atomic write request fields.
 func turso_sync_database_io_request_full_write(self TursoSyncIoItem) (TursoSyncIoFullWriteRequest, error) {
 	var r turso_sync_io_full_write_request_t
-	status := c_turso_sync_database_io_request_full_write(self, &r)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_request_full_write(self, &r) })
 	if status != int32(TURSO_OK) {
 		return TursoSyncIoFullWriteRequest{}, statusToError(TursoStatusCode(status), "")
 	}
@@ -715,7 +715,7 @@ func turso_sync_database_io_poison(self TursoSyncIoItem, errMsg string) error {
 		ref.ptr = uintptr(unsafe.Pointer(&bytes[0]))
 		ref.len = uintptr(len(bytes))
 	}
-	status := c_turso_sync_database_io_poison(self, &ref)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_poison(self, &ref) })
 	// Keep Go memory alive during call
 	runtime.KeepAlive(bytes)
 	if status == int32(TURSO_OK) {
@@ -726,7 +726,7 @@ func turso_sync_database_io_poison(self TursoSyncIoItem, errMsg string) error {
 
 // turso_sync_database_io_status sets IO request completion status (e.g. HTTP status).
 func turso_sync_database_io_status(self TursoSyncIoItem, statusCode int) error {
-	status := c_turso_sync_database_io_status(self, int32(statusCode))
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_status(self, int32(statusCode)) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -740,7 +740,7 @@ func turso_sync_database_io_push_buffer(self TursoSyncIoItem, buffer []byte) err
 		ref.ptr = uintptr(unsafe.Pointer(&buffer[0]))
 		ref.len = uintptr(len(buffer))
 	}
-	status := c_turso_sync_database_io_push_buffer(self, &ref)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_push_buffer(self, &ref) })
 	// Keep Go memory alive during call
 	runtime.KeepAlive(buffer)
 	if status == int32(TURSO_OK) {
@@ -751,7 +751,7 @@ func turso_sync_database_io_push_buffer(self TursoSyncIoItem, buffer []byte) err
 
 // turso_sync_database_io_done sets IO request completion as done.
 func turso_sync_database_io_done(self TursoSyncIoItem) error {
-	status := c_turso_sync_database_io_done(self)
+	status := withNativeCall(func() int32 { return c_turso_sync_database_io_done(self) })
 	if status == int32(TURSO_OK) {
 		return nil
 	}
@@ -760,20 +760,20 @@ func turso_sync_database_io_done(self TursoSyncIoItem) error {
 
 // turso_sync_database_deinit deallocates a TursoDatabaseSync.
 func turso_sync_database_deinit(self TursoSyncDatabase) {
-	c_turso_sync_database_deinit(self)
+	withNativeCallVoid(func() { c_turso_sync_database_deinit(self) })
 }
 
 // turso_sync_operation_deinit deallocates a TursoAsyncOperation.
 func turso_sync_operation_deinit(self TursoSyncOperation) {
-	c_turso_sync_operation_deinit(self)
+	withNativeCallVoid(func() { c_turso_sync_operation_deinit(self) })
 }
 
 // turso_sync_database_io_item_deinit deallocates a SyncEngineIoQueueItem.
 func turso_sync_database_io_item_deinit(self TursoSyncIoItem) {
-	c_turso_sync_database_io_item_deinit(self)
+	withNativeCallVoid(func() { c_turso_sync_database_io_item_deinit(self) })
 }
 
 // turso_sync_changes_deinit deallocates a TursoDatabaseSyncChanges.
 func turso_sync_changes_deinit(self TursoSyncChanges) {
-	c_turso_sync_changes_deinit(self)
+	withNativeCallVoid(func() { c_turso_sync_changes_deinit(self) })
 }

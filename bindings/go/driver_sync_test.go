@@ -426,6 +426,55 @@ func TestSyncRollbackReadTxnAfterCommit(t *testing.T) {
 	require.Nil(t, err)
 }
 
+func TestSyncAndDatabaseConcurrentHandles(t *testing.T) {
+	bootstrapIfEmpty := false
+	syncDB, err := NewTursoSyncDb(t.Context(), TursoSyncDbConfig{
+		Path:             path.Join(t.TempDir(), "sync.db"),
+		BootstrapIfEmpty: &bootstrapIfEmpty,
+	})
+	require.NoError(t, err)
+	syncConn, err := syncDB.Connect(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, syncConn.Close())
+		turso_sync_database_deinit(syncDB.db)
+	})
+
+	databaseConn := openMem(t)
+	for _, db := range []*sql.DB{syncConn, databaseConn} {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE events(value INTEGER)")
+		require.NoError(t, err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, db := range []*sql.DB{syncConn, databaseConn} {
+		go func() {
+			<-start
+			for value := range 64 {
+				if _, err := db.ExecContext(t.Context(), "INSERT INTO events(value) VALUES (?)", value); err != nil {
+					results <- err
+					return
+				}
+			}
+			var count int
+			if err := db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM events").Scan(&count); err != nil {
+				results <- err
+				return
+			}
+			if count != 64 {
+				results <- fmt.Errorf("row count = %d, want 64", count)
+				return
+			}
+			results <- nil
+		}()
+	}
+
+	close(start)
+	require.NoError(t, <-results)
+	require.NoError(t, <-results)
+}
+
 func TestSyncConfigPersistence(t *testing.T) {
 	server, err := NewTursoServer()
 	require.Nil(t, err)
