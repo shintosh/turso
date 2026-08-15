@@ -386,6 +386,43 @@ func TestDuplicateConnection(t *testing.T) {
 	}
 }
 
+func TestDriverConcurrentHandles(t *testing.T) {
+	first := openMem(t)
+	second := openMem(t)
+	for _, db := range []*sql.DB{first, second} {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE events(value INTEGER)")
+		require.NoError(t, err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, db := range []*sql.DB{first, second} {
+		go func() {
+			<-start
+			for value := range 64 {
+				if _, err := db.ExecContext(t.Context(), "INSERT INTO events(value) VALUES (?)", value); err != nil {
+					results <- err
+					return
+				}
+			}
+			var count int
+			if err := db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM events").Scan(&count); err != nil {
+				results <- err
+				return
+			}
+			if count != 64 {
+				results <- fmt.Errorf("row count = %d, want 64", count)
+				return
+			}
+			results <- nil
+		}()
+	}
+
+	close(start)
+	require.NoError(t, <-results)
+	require.NoError(t, <-results)
+}
+
 func TestDuplicateConnection2(t *testing.T) {
 	newConn := openMem(t)
 	sql := "CREATE TABLE test (foo INTEGER, bar INTEGER, baz BLOB);"
