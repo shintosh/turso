@@ -306,6 +306,16 @@ func (c *tursoDbConnection) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	dest := make([]driver.Value, len(rows.Columns()))
+	for {
+		err := rows.Next(dest)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return errors.Join(err, rows.Close())
+		}
+	}
 	return rows.Close()
 }
 

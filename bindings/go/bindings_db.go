@@ -536,13 +536,21 @@ func turso_statement_reset(self TursoStatement) error {
 
 // turso_statement_finalize finalizes a statement.
 func turso_statement_finalize(self TursoStatement) error {
-	var errPtr *byte
-	status := withNativeCall(func() turso_status_code_t { return c_turso_statement_finalize(self, &errPtr) })
-	if status == int32(TURSO_OK) {
-		return nil
+	for {
+		var errPtr *byte
+		status := withNativeCall(func() turso_status_code_t { return c_turso_statement_finalize(self, &errPtr) })
+		switch TursoStatusCode(status) {
+		case TURSO_OK, TURSO_DONE:
+			return nil
+		case TURSO_IO:
+			if err := turso_statement_run_io(self); err != nil {
+				return err
+			}
+		default:
+			msg := decodeAndFreeCString(errPtr)
+			return statusToError(TursoStatusCode(status), msg)
+		}
 	}
-	msg := decodeAndFreeCString(errPtr)
-	return statusToError(TursoStatusCode(status), msg)
 }
 
 // turso_statement_n_change returns amount of row modifications (insert/delete operations) made by the most recent executed statement.
