@@ -36,6 +36,63 @@ func openMem(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestPingFinalizesEveryStatement(t *testing.T) {
+	db := openMem(t)
+	db.SetMaxOpenConns(1)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	originalPrepare := c_turso_connection_prepare_single
+	originalFinalize := c_turso_statement_finalize
+	originalDeinit := c_turso_statement_deinit
+	t.Cleanup(func() {
+		c_turso_connection_prepare_single = originalPrepare
+		c_turso_statement_finalize = originalFinalize
+		c_turso_statement_deinit = originalDeinit
+	})
+
+	constructed := 0
+	finalized := 0
+	deinitialized := 0
+	c_turso_connection_prepare_single = func(self TursoConnection, sql string, statement **turso_statement_t, errorOut **byte) turso_status_code_t {
+		status := originalPrepare(self, sql, statement, errorOut)
+		if status == int32(TURSO_OK) {
+			constructed++
+		}
+		return status
+	}
+	c_turso_statement_finalize = func(statement TursoStatement, errorOut **byte) turso_status_code_t {
+		finalized++
+		return originalFinalize(statement, errorOut)
+	}
+	c_turso_statement_deinit = func(statement TursoStatement) {
+		deinitialized++
+		originalDeinit(statement)
+	}
+
+	const pingCount = 25
+	for range pingCount {
+		require.NoError(t, db.PingContext(t.Context()))
+	}
+	require.Equal(t, pingCount, constructed)
+	require.Equal(t, constructed, finalized)
+	require.Equal(t, constructed, deinitialized)
+}
+
+func TestPingReturnsStatementFinalizeError(t *testing.T) {
+	db := openMem(t)
+	db.SetMaxOpenConns(1)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	originalFinalize := c_turso_statement_finalize
+	t.Cleanup(func() { c_turso_statement_finalize = originalFinalize })
+	c_turso_statement_finalize = func(statement TursoStatement, errorOut **byte) turso_status_code_t {
+		_ = originalFinalize(statement, errorOut)
+		return int32(TURSO_ERROR)
+	}
+
+	require.ErrorIs(t, db.PingContext(t.Context()), ErrTursoGeneric)
+}
+
 func TestLocalMaintenanceConformance(t *testing.T) {
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "owner.db")

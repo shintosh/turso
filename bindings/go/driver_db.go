@@ -302,11 +302,11 @@ func (c *tursoDbConnection) Ping(ctx context.Context) error {
 		return err
 	}
 	// trivial ping: simple select constant
-	_, err := c.QueryContext(ctx, "SELECT 1", nil)
+	rows, err := c.QueryContext(ctx, "SELECT 1", nil)
 	if err != nil {
 		return err
 	}
-	return nil
+	return rows.Close()
 }
 
 func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -906,9 +906,9 @@ func (r *tursoDbRows) Close() error {
 		return nil
 	}
 	r.closed = true
-	_ = turso_statement_finalize(r.stmt)
+	err := turso_statement_finalize(r.stmt)
 	turso_statement_deinit(r.stmt)
-	return nil
+	return err
 }
 
 func (r *tursoDbRows) Next(dest []driver.Value) error {
