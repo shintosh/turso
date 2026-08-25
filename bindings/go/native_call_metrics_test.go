@@ -7,6 +7,9 @@ import (
 
 func TestNativeCallMetricsDescribeCompletedDatabaseWork(t *testing.T) {
 	before := ReadNativeCallMetrics()
+	if before.ActiveCalls != 0 {
+		t.Fatalf("active native calls before work = %d, want 0", before.ActiveCalls)
+	}
 	db, err := sql.Open("turso", ":memory:")
 	if err != nil {
 		t.Fatalf("open database: %v", err)
@@ -26,6 +29,9 @@ func TestNativeCallMetricsDescribeCompletedDatabaseWork(t *testing.T) {
 		t.Fatalf("probe count = %d, want 1", count)
 	}
 	after := ReadNativeCallMetrics()
+	if after.ActiveCalls != 0 {
+		t.Fatalf("active native calls after work = %d, want 0", after.ActiveCalls)
+	}
 	if after.Calls <= before.Calls {
 		t.Fatalf("native calls did not advance: before=%d after=%d", before.Calls, after.Calls)
 	}

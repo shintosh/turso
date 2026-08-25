@@ -10,12 +10,14 @@ import (
 // It contains no SQL text, database paths, or handle identities.
 type NativeCallMetrics struct {
 	Calls          uint64
+	ActiveCalls    uint64
 	ExecutionTime  time.Duration
 	ObjectLocks    uint64
 	ObjectWaitTime time.Duration
 }
 
 var nativeCallCount atomic.Uint64
+var nativeCallActive atomic.Uint64
 var nativeCallExecutionNanos atomic.Uint64
 var nativeObjectLockCount atomic.Uint64
 var nativeObjectWaitNanos atomic.Uint64
@@ -40,11 +42,19 @@ func recordNativeCallExecution(elapsed time.Duration) {
 	nativeCallExecutionNanos.Add(uint64(elapsed))
 }
 
+func beginNativeCall() func() {
+	nativeCallActive.Add(1)
+	return func() {
+		nativeCallActive.Add(^uint64(0))
+	}
+}
+
 // ReadNativeCallMetrics returns one consistent-enough monotonic telemetry
 // snapshot. Callers compute interval deltas from two snapshots.
 func ReadNativeCallMetrics() NativeCallMetrics {
 	return NativeCallMetrics{
 		Calls:          nativeCallCount.Load(),
+		ActiveCalls:    nativeCallActive.Load(),
 		ExecutionTime:  time.Duration(nativeCallExecutionNanos.Load()),
 		ObjectLocks:    nativeObjectLockCount.Load(),
 		ObjectWaitTime: time.Duration(nativeObjectWaitNanos.Load()),

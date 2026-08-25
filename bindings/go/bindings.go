@@ -11,6 +11,8 @@ import (
 var initLibrary sync.Once
 
 func withNativeCall[T any](call func() T) T {
+	end := beginNativeCall()
+	defer end()
 	started := time.Now()
 	result := call()
 	recordNativeCallExecution(time.Since(started))
@@ -18,6 +20,8 @@ func withNativeCall[T any](call func() T) T {
 }
 
 func withNativeCallVoid(call func()) {
+	end := beginNativeCall()
+	defer end()
 	started := time.Now()
 	call()
 	recordNativeCallExecution(time.Since(started))
