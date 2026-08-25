@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
@@ -125,7 +124,7 @@ type TursoSyncDb struct {
 	client      *http.Client
 	busyTimeout int // busy timeout in milliseconds (0 = disabled)
 
-	mu sync.Mutex
+	mu nativeObjectMutex
 }
 
 // main constructor to create synced database

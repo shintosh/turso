@@ -3,27 +3,24 @@ package turso
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
 var initLibrary sync.Once
 
-// nativeCallMu serializes every entry into the embedded Turso library. The
-// library shares process-global native state, so separate Go database handles
-// cannot safely call it at the same time.
-var nativeCallMu sync.Mutex
-
 func withNativeCall[T any](call func() T) T {
-	nativeCallMu.Lock()
-	defer nativeCallMu.Unlock()
-	return call()
+	started := time.Now()
+	result := call()
+	recordNativeCallExecution(time.Since(started))
+	return result
 }
 
 func withNativeCallVoid(call func()) {
-	nativeCallMu.Lock()
-	defer nativeCallMu.Unlock()
+	started := time.Now()
 	call()
+	recordNativeCallExecution(time.Since(started))
 }
 
 func InitLibrary(strategy turso_libs.LoadTursoLibraryConfig) {

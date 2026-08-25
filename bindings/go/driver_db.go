@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
@@ -37,7 +36,7 @@ type tursoDbConnection struct {
 	extraIo func() error
 	path    string
 
-	mu          sync.Mutex
+	mu          nativeObjectMutex
 	closed      bool
 	busyTimeout int // current busy timeout in milliseconds
 	// keep flags for configuration if needed

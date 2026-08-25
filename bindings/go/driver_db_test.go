@@ -480,6 +480,48 @@ func TestDriverConcurrentHandles(t *testing.T) {
 	require.NoError(t, <-results)
 }
 
+func TestIndependentDatabaseProgressWhileWriterWaits(t *testing.T) {
+	blockedPath := path.Join(t.TempDir(), "blocked.db")
+	blocked, err := sql.Open("turso", blockedPath)
+	require.NoError(t, err)
+	blocked.SetMaxOpenConns(2)
+	blocked.SetMaxIdleConns(2)
+	t.Cleanup(func() { require.NoError(t, blocked.Close()) })
+	_, err = blocked.Exec("CREATE TABLE events(id INTEGER PRIMARY KEY)")
+	require.NoError(t, err)
+
+	holder, err := blocked.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = holder.Exec("INSERT INTO events(id) VALUES (1)")
+	require.NoError(t, err)
+
+	waiterStarted := make(chan struct{})
+	waiterDone := make(chan error, 1)
+	go func() {
+		close(waiterStarted)
+		_, waitErr := blocked.Exec("INSERT INTO events(id) VALUES (2)")
+		waiterDone <- waitErr
+	}()
+	<-waiterStarted
+	time.Sleep(25 * time.Millisecond)
+
+	independent := openMem(t)
+	probeCtx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	var value int
+	if err := independent.QueryRowContext(probeCtx, "SELECT 1").Scan(&value); err != nil {
+		_ = holder.Rollback()
+		t.Fatalf("independent database probe waited behind blocked writer: %v", err)
+	}
+	require.Equal(t, 1, value)
+	require.NoError(t, holder.Commit())
+	require.NoError(t, <-waiterDone)
+
+	var count int
+	require.NoError(t, blocked.QueryRow("SELECT COUNT(*) FROM events").Scan(&count))
+	require.Equal(t, 2, count)
+}
+
 func TestDuplicateConnection2(t *testing.T) {
 	newConn := openMem(t)
 	sql := "CREATE TABLE test (foo INTEGER, bar INTEGER, baz BLOB);"
