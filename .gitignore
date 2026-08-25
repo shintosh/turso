@@ -109,3 +109,6 @@ dhat-heap.json
 
 # pgregress actual output and diffs
 postgres/regress/results/
+
+# Local agent harness artifacts (reviews, plans, scratch)
+.harness/
